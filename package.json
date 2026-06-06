@@ -1,0 +1,30 @@
+{
+  "name": "stellar-agent-kit",
+  "version": "1.0.0",
+  "description": "Modular, secure Stellar Agent Kit with PayFi / x402 support",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:ts": "vitest run",
+    "test:ts:watch": "vitest",
+    "test:ts:coverage": "vitest run --coverage",
+    "test:rust": "cargo test --manifest-path contracts/escrow/Cargo.toml",
+    "test:all": "npm run test:rust && npm run test:ts",
+    "lint": "eslint 'backend/**/*.ts' 'tests/**/*.ts'"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.0.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0"
+  }
+}

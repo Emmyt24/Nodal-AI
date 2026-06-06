@@ -1,0 +1,338 @@
+/**
+ * tests/payment.test.ts
+ *
+ * Comprehensive test suite for StellarPaymentTool.
+ * Covers: happy path, input validation, network errors, retry exhaustion,
+ * timeout simulation, insufficient funds, and memo edge cases.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { StellarPaymentTool } from "../backend/tools/StellarPaymentTool";
+import * as rpcClient from "../backend/rpc_client";
+
+// ─── Module mock ──────────────────────────────────────────────────────────────
+// All Horizon/Soroban network calls are intercepted here.
+
+vi.mock("../backend/rpc_client", () => ({
+  loadAccount: vi.fn(),
+  submitTransaction: vi.fn(),
+  horizonServer: {},
+  sorobanServer: {},
+  simulateSorobanTx: vi.fn(),
+  prepareSorobanTx: vi.fn(),
+}));
+
+// ─── Mock config — isolate from real .env ─────────────────────────────────────
+vi.mock("../backend/config", () => ({
+  config: {
+    STELLAR_NETWORK: "testnet",
+    HORIZON_URL: "https://horizon-testnet.stellar.org",
+    SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org",
+    AGENT_SECRET_KEY: "SBPTNBEQQVQD5NIPZTCXHKM5ZVONK2ENLP5DTZJBGSUPOPWQSIFWZKX",
+    X402_ASSET_CODE: "USDC",
+    X402_ASSET_ISSUER: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    MAX_RETRIES: 3,
+    RETRY_DELAY_MS: 100, // fast in tests
+  },
+}));
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+const TEST_SECRET = "SBPTNBEQQVQD5NIPZTCXHKM5ZVONK2ENLP5DTZJBGSUPOPWQSIFWZKX";
+// Valid 56-char G-address for destination
+const VALID_DEST   = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+const VALID_ISSUER = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+
+/** Minimal account object that satisfies TransactionBuilder */
+function makeMockAccount(publicKey: string) {
+  return {
+    id: publicKey,
+    accountId: () => publicKey,
+    sequenceNumber: () => "100",
+    incrementSequenceNumber: vi.fn(),
+    sequence: "100",
+    incrementedSequenceNumber: () => "101",
+    thresholds: { low_threshold: 0, med_threshold: 0, high_threshold: 0 },
+    flags: { auth_required: false, auth_revocable: false, auth_immutable: false },
+    balances: [{ asset_type: "native", balance: "10000.0000000" }],
+    signers: [],
+    data_attr: {},
+    subentry_count: 0,
+    home_domain: "",
+    inflation_dest: null,
+  };
+}
+
+// ─── Test suite ───────────────────────────────────────────────────────────────
+
+describe("StellarPaymentTool", () => {
+  let tool: StellarPaymentTool;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tool = new StellarPaymentTool(TEST_SECRET);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // ── Input validation ────────────────────────────────────────────────────────
+
+  describe("Input validation", () => {
+    it("rejects a destination key that is too short", async () => {
+      await expect(
+        tool.execute({ destination: "GABC123", amount: "10", assetCode: "XLM" })
+      ).rejects.toThrow(/Invalid Stellar public key/);
+    });
+
+    it("rejects a destination key that is too long", async () => {
+      await expect(
+        tool.execute({ destination: "G".padEnd(57, "A"), amount: "10", assetCode: "XLM" })
+      ).rejects.toThrow(/Invalid Stellar public key/);
+    });
+
+    it("rejects a negative amount", async () => {
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "-1", assetCode: "XLM" })
+      ).rejects.toThrow(/Amount must be/);
+    });
+
+    it("rejects zero amount (not a valid Stellar decimal)", async () => {
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "0", assetCode: "XLM" })
+      ).rejects.toThrow(/Amount must be/);
+    });
+
+    it("rejects amount with more than 7 decimal places", async () => {
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1.12345678", assetCode: "XLM" })
+      ).rejects.toThrow(/Amount must be/);
+    });
+
+    it("rejects a non-XLM asset when issuer is missing", async () => {
+      await expect(
+        tool.execute({
+          destination: VALID_DEST,
+          amount: "10",
+          assetCode: "USDC",
+          assetIssuer: undefined,
+        })
+      ).rejects.toThrow();
+    });
+
+    it("rejects a memo longer than 28 bytes", async () => {
+      await expect(
+        tool.execute({
+          destination: VALID_DEST,
+          amount: "1",
+          assetCode: "XLM",
+          memo: "A".repeat(29),
+        })
+      ).rejects.toThrow();
+    });
+
+    it("accepts a 7-decimal amount (boundary)", async () => {
+      vi.mocked(rpcClient.loadAccount).mockResolvedValue(
+        makeMockAccount(tool.publicKey) as any
+      );
+      vi.mocked(rpcClient.submitTransaction).mockResolvedValue({
+        hash: "boundary_hash",
+        ledger: 1,
+      } as any);
+
+      const result = await tool.execute({
+        destination: VALID_DEST,
+        amount: "0.0000001",
+        assetCode: "XLM",
+      });
+      expect(result.txHash).toBe("boundary_hash");
+    });
+  });
+
+  // ── Happy path ──────────────────────────────────────────────────────────────
+
+  describe("Happy path", () => {
+    beforeEach(() => {
+      vi.mocked(rpcClient.loadAccount).mockResolvedValue(
+        makeMockAccount(tool.publicKey) as any
+      );
+      vi.mocked(rpcClient.submitTransaction).mockResolvedValue({
+        hash: "success_tx_hash",
+        ledger: 42,
+      } as any);
+    });
+
+    it("completes an XLM payment and returns txHash + ledger", async () => {
+      const result = await tool.execute({
+        destination: VALID_DEST,
+        amount: "100",
+        assetCode: "XLM",
+      });
+
+      expect(result.txHash).toBe("success_tx_hash");
+      expect(result.ledger).toBe(42);
+    });
+
+    it("completes a custom asset payment (USDC)", async () => {
+      const result = await tool.execute({
+        destination: VALID_DEST,
+        amount: "50.5",
+        assetCode: "USDC",
+        assetIssuer: VALID_ISSUER,
+      });
+
+      expect(result.txHash).toBe("success_tx_hash");
+    });
+
+    it("calls loadAccount with the agent public key", async () => {
+      await tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" });
+      expect(rpcClient.loadAccount).toHaveBeenCalledOnce();
+      expect(rpcClient.loadAccount).toHaveBeenCalledWith(tool.publicKey);
+    });
+
+    it("calls submitTransaction exactly once per payment", async () => {
+      await tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" });
+      expect(rpcClient.submitTransaction).toHaveBeenCalledOnce();
+    });
+
+    it("embeds a memo when provided", async () => {
+      // We just verify execute doesn't throw and the memo is accepted
+      const result = await tool.execute({
+        destination: VALID_DEST,
+        amount: "1",
+        assetCode: "XLM",
+        memo: "test-memo-123",
+      });
+      expect(result.txHash).toBeTruthy();
+    });
+  });
+
+  // ── Horizon / network error handling ────────────────────────────────────────
+
+  describe("Network error handling", () => {
+    beforeEach(() => {
+      vi.mocked(rpcClient.loadAccount).mockResolvedValue(
+        makeMockAccount(tool.publicKey) as any
+      );
+    });
+
+    it("propagates Horizon submission error", async () => {
+      vi.mocked(rpcClient.submitTransaction).mockRejectedValue(
+        new Error("Horizon: transaction failed — op_no_source_account")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/op_no_source_account/);
+    });
+
+    it("surfaces insufficient funds error from Horizon", async () => {
+      vi.mocked(rpcClient.submitTransaction).mockRejectedValue(
+        new Error("Horizon: op_underfunded — insufficient balance")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "999999", assetCode: "XLM" })
+      ).rejects.toThrow(/underfunded/);
+    });
+
+    it("propagates account not found error", async () => {
+      vi.mocked(rpcClient.loadAccount).mockRejectedValue(
+        new Error("Horizon: account not found (404)")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/account not found/);
+    });
+
+    it("handles network timeout from loadAccount", async () => {
+      vi.mocked(rpcClient.loadAccount).mockRejectedValue(
+        Object.assign(new Error("ECONNABORTED: network timeout after 30000ms"), {
+          code: "ECONNABORTED",
+        })
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/timeout/i);
+    });
+
+    it("handles network timeout from submitTransaction", async () => {
+      vi.mocked(rpcClient.submitTransaction).mockRejectedValue(
+        Object.assign(new Error("ECONNABORTED: network timeout after 30000ms"), {
+          code: "ECONNABORTED",
+        })
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/timeout/i);
+    });
+
+    it("surfaces tx_bad_seq when sequence number is stale", async () => {
+      vi.mocked(rpcClient.submitTransaction).mockRejectedValue(
+        new Error("Horizon: tx_bad_seq — sequence number is not valid")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/tx_bad_seq/);
+    });
+
+    it("surfaces destination account non-existent (op_no_destination)", async () => {
+      vi.mocked(rpcClient.submitTransaction).mockRejectedValue(
+        new Error("Horizon: op_no_destination — destination account does not exist")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/op_no_destination/);
+    });
+  });
+
+  // ── Retry exhaustion ────────────────────────────────────────────────────────
+
+  describe("Retry exhaustion", () => {
+    it("throws after all retries are exhausted on loadAccount", async () => {
+      // rpcClient.loadAccount is already wrapped in withRetry internally.
+      // We simulate the final rejection reaching the tool.
+      vi.mocked(rpcClient.loadAccount).mockRejectedValue(
+        new Error("max retries exceeded: 503 Service Unavailable")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/503/);
+    });
+
+    it("throws after all retries exhausted on submitTransaction", async () => {
+      vi.mocked(rpcClient.submitTransaction).mockRejectedValue(
+        new Error("max retries exceeded: Horizon unavailable")
+      );
+
+      await expect(
+        tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" })
+      ).rejects.toThrow(/Horizon unavailable/);
+    });
+  });
+
+  // ── State verification ──────────────────────────────────────────────────────
+
+  describe("State verification", () => {
+    it("does not call submitTransaction when loadAccount fails", async () => {
+      vi.mocked(rpcClient.loadAccount).mockRejectedValue(new Error("not found"));
+
+      try {
+        await tool.execute({ destination: VALID_DEST, amount: "1", assetCode: "XLM" });
+      } catch (_) { /* expected */ }
+
+      expect(rpcClient.submitTransaction).not.toHaveBeenCalled();
+    });
+
+    it("exposes the agent public key", () => {
+      expect(tool.publicKey).toMatch(/^G[A-Z2-7]{55}$/);
+    });
+  });
+});

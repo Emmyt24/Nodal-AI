@@ -1,0 +1,229 @@
+/**
+ * tests/x402.test.ts
+ *
+ * Comprehensive test suite for X402PaymentTool.
+ * Covers: valid flow, schema validation, expiry, edge cases,
+ * network failures during payment, and proof structure integrity.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { X402PaymentTool } from "../backend/tools/X402PaymentTool";
+import { StellarPaymentTool } from "../backend/tools/StellarPaymentTool";
+
+// ─── Mock StellarPaymentTool so x402 tests don't hit Horizon ─────────────────
+
+vi.mock("../backend/tools/StellarPaymentTool", () => ({
+  StellarPaymentTool: vi.fn().mockImplementation(() => ({
+    publicKey: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+    execute: vi.fn().mockResolvedValue({ txHash: "x402_mock_tx_hash", ledger: 99 }),
+  })),
+}));
+
+vi.mock("../backend/config", () => ({
+  config: {
+    STELLAR_NETWORK: "testnet",
+    HORIZON_URL: "https://horizon-testnet.stellar.org",
+    SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org",
+    AGENT_SECRET_KEY: "SBPTNBEQQVQD5NIPZTCXHKM5ZVONK2ENLP5DTZJBGSUPOPWQSIFWZKX",
+    X402_ASSET_CODE: "USDC",
+    X402_ASSET_ISSUER: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    MAX_RETRIES: 3,
+    RETRY_DELAY_MS: 100,
+  },
+}));
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+const TEST_SECRET   = "SBPTNBEQQVQD5NIPZTCXHKM5ZVONK2ENLP5DTZJBGSUPOPWQSIFWZKX";
+const VALID_PAY_TO  = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+const VALID_ISSUER  = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+
+function futureIso(offsetMs = 60_000): string {
+  return new Date(Date.now() + offsetMs).toISOString();
+}
+
+const VALID_CHALLENGE = {
+  resource: "https://api.example.com/data",
+  amount: "1.5000000",
+  assetCode: "USDC",
+  assetIssuer: VALID_ISSUER,
+  payTo: VALID_PAY_TO,
+  nonce: "550e8400-e29b-41d4-a716-446655440000",
+  expiresAt: futureIso(),
+};
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe("X402PaymentTool", () => {
+  let tool: X402PaymentTool;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tool = new X402PaymentTool(TEST_SECRET);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // ── Schema validation ───────────────────────────────────────────────────────
+
+  describe("Schema validation", () => {
+    it("rejects a challenge with a missing nonce", async () => {
+      const { nonce: _omit, ...noNonce } = VALID_CHALLENGE;
+      await expect(tool.respond(noNonce)).rejects.toThrow();
+    });
+
+    it("rejects a non-UUID nonce", async () => {
+      await expect(
+        tool.respond({ ...VALID_CHALLENGE, nonce: "not-a-uuid" })
+      ).rejects.toThrow(/UUID/);
+    });
+
+    it("rejects a missing resource URL", async () => {
+      const { resource: _omit, ...noResource } = VALID_CHALLENGE;
+      await expect(tool.respond(noResource)).rejects.toThrow();
+    });
+
+    it("rejects a non-URL resource field", async () => {
+      await expect(
+        tool.respond({ ...VALID_CHALLENGE, resource: "not-a-url" })
+      ).rejects.toThrow(/URL/);
+    });
+
+    it("rejects a payTo address that is too short", async () => {
+      await expect(
+        tool.respond({ ...VALID_CHALLENGE, payTo: "GBBD47" })
+      ).rejects.toThrow(/Stellar address/);
+    });
+
+    it("rejects missing expiresAt field", async () => {
+      const { expiresAt: _omit, ...noExpiry } = VALID_CHALLENGE;
+      await expect(tool.respond(noExpiry)).rejects.toThrow();
+    });
+
+    it("rejects an expiresAt that is not a valid ISO datetime", async () => {
+      await expect(
+        tool.respond({ ...VALID_CHALLENGE, expiresAt: "not-a-date" })
+      ).rejects.toThrow();
+    });
+
+    it("rejects a completely empty object", async () => {
+      await expect(tool.respond({})).rejects.toThrow();
+    });
+
+    it("rejects null input", async () => {
+      await expect(tool.respond(null)).rejects.toThrow();
+    });
+  });
+
+  // ── Expiry guard ─────────────────────────────────────────────────────────────
+
+  describe("Expiry guard", () => {
+    it("rejects a challenge expired 1 ms ago", async () => {
+      await expect(
+        tool.respond({ ...VALID_CHALLENGE, expiresAt: new Date(Date.now() - 1).toISOString() })
+      ).rejects.toThrow(/expired/);
+    });
+
+    it("rejects a challenge expired 1 hour ago", async () => {
+      await expect(
+        tool.respond({ ...VALID_CHALLENGE, expiresAt: new Date(Date.now() - 3_600_000).toISOString() })
+      ).rejects.toThrow(/expired/);
+    });
+
+    it("accepts a challenge expiring 1 ms from now", async () => {
+      const proof = await tool.respond({
+        ...VALID_CHALLENGE,
+        expiresAt: futureIso(1),
+      });
+      expect(proof.txHash).toBeTruthy();
+    });
+  });
+
+  // ── Happy path ──────────────────────────────────────────────────────────────
+
+  describe("Happy path", () => {
+    it("returns a valid x402 payment proof structure", async () => {
+      const proof = await tool.respond(VALID_CHALLENGE);
+
+      expect(proof.protocol).toBe("x402");
+      expect(proof.network).toBe("testnet");
+      expect(proof.txHash).toBe("x402_mock_tx_hash");
+      expect(proof.nonce).toBe(VALID_CHALLENGE.nonce);
+      expect(proof.payer).toMatch(/^G[A-Z2-7]{55}$/);
+      expect(proof.signedAt).toBeTruthy();
+      expect(new Date(proof.signedAt).getTime()).toBeLessThanOrEqual(Date.now());
+    });
+
+    it("embeds nonce in memo (first 28 chars)", async () => {
+      await tool.respond(VALID_CHALLENGE);
+
+      const mockPaymentTool = vi.mocked(StellarPaymentTool).mock.results[0].value;
+      const callArg = mockPaymentTool.execute.mock.calls[0][0] as any;
+
+      expect(callArg.memo).toBe(VALID_CHALLENGE.nonce.slice(0, 28));
+    });
+
+    it("delegates to StellarPaymentTool with correct destination and amount", async () => {
+      await tool.respond(VALID_CHALLENGE);
+
+      const mockPaymentTool = vi.mocked(StellarPaymentTool).mock.results[0].value;
+      expect(mockPaymentTool.execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          destination: VALID_CHALLENGE.payTo,
+          amount: VALID_CHALLENGE.amount,
+          assetCode: VALID_CHALLENGE.assetCode,
+          assetIssuer: VALID_CHALLENGE.assetIssuer,
+        })
+      );
+    });
+
+    it("omits assetIssuer for XLM payments", async () => {
+      await tool.respond({ ...VALID_CHALLENGE, assetCode: "XLM" });
+
+      const mockPaymentTool = vi.mocked(StellarPaymentTool).mock.results[0].value;
+      const callArg = mockPaymentTool.execute.mock.calls[0][0] as any;
+      expect(callArg.assetIssuer).toBeUndefined();
+    });
+
+    it("calls StellarPaymentTool.execute exactly once per challenge", async () => {
+      await tool.respond(VALID_CHALLENGE);
+
+      const mockPaymentTool = vi.mocked(StellarPaymentTool).mock.results[0].value;
+      expect(mockPaymentTool.execute).toHaveBeenCalledOnce();
+    });
+  });
+
+  // ── Payment failure propagation ─────────────────────────────────────────────
+
+  describe("Payment failure propagation", () => {
+    function getMockExecute() {
+      return vi.mocked(StellarPaymentTool).mock.results[0].value.execute as ReturnType<typeof vi.fn>;
+    }
+
+    it("propagates insufficient funds from underlying payment", async () => {
+      getMockExecute().mockRejectedValueOnce(
+        new Error("Horizon: op_underfunded — insufficient balance")
+      );
+
+      await expect(tool.respond(VALID_CHALLENGE)).rejects.toThrow(/underfunded/);
+    });
+
+    it("propagates network timeout from underlying payment", async () => {
+      getMockExecute().mockRejectedValueOnce(
+        new Error("ECONNABORTED: network timeout")
+      );
+
+      await expect(tool.respond(VALID_CHALLENGE)).rejects.toThrow(/timeout/);
+    });
+
+    it("propagates trust line missing error", async () => {
+      getMockExecute().mockRejectedValueOnce(
+        new Error("Horizon: op_no_trust — recipient missing trust line for USDC")
+      );
+
+      await expect(tool.respond(VALID_CHALLENGE)).rejects.toThrow(/no_trust/);
+    });
+  });
+});
