@@ -12,6 +12,18 @@ import {
 } from "@stellar/stellar-sdk";
 import { ZodError } from "zod";
 import { config } from "./config";
+import { validateXDR } from "./types/xdr";
+
+// ─── Timeout error ────────────────────────────────────────────────────────────
+
+export class TimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Transaction Timeout: request did not complete within ${ms}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+const SUBMIT_TIMEOUT_MS = 30_000;
 
 // ─── Exponential back-off retry ─────────────────────────────────────────────
 
@@ -29,7 +41,7 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   retries = config.MAX_RETRIES,
   delayMs = config.RETRY_DELAY_MS,
-  isRetryable: (err: unknown) => boolean = DEFAULT_IS_RETRYABLE
+  maxDelayMs = 30_000
 ): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -42,7 +54,12 @@ export async function withRetry<T>(
       lastErr = err;
       console.warn(`⚠️  Attempt ${attempt}/${retries} failed:`, (err as Error).message);
       if (attempt < retries) {
-        await new Promise((r) => setTimeout(r, delayMs * attempt)); // exponential back-off
+        // True exponential back-off: 1500 → 3000 → 6000 ms for RETRY_DELAY_MS=1500
+        const exponential = delayMs * Math.pow(2, attempt - 1);
+        const capped = Math.min(exponential, maxDelayMs);
+        // ±20% jitter to prevent thundering herd across simultaneous agent instances
+        const jitter = Math.random() * 0.2 * capped;
+        await new Promise((r) => setTimeout(r, capped + jitter));
       }
     }
   }
@@ -60,7 +77,25 @@ export async function loadAccount(publicKey: string) {
 }
 
 export async function submitTransaction(tx: Transaction | FeeBumpTransaction) {
-  return withRetry(() => horizonServer.submitTransaction(tx), config.MAX_RETRIES, config.RETRY_DELAY_MS, DEFAULT_IS_RETRYABLE);
+  // Guard: validate XDR encoding before initiating any network call
+  validateXDR(tx.toEnvelope().toXDR("base64"));
+
+  return withRetry(() => {
+    const controller = new AbortController();
+    let timeoutId: ReturnType<typeof setTimeout>;
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+        reject(new TimeoutError(SUBMIT_TIMEOUT_MS));
+      }, SUBMIT_TIMEOUT_MS);
+    });
+
+    return Promise.race([
+      horizonServer.submitTransaction(tx),
+      timeoutPromise,
+    ]).finally(() => clearTimeout(timeoutId));
+  });
 }
 
 // ─── Soroban RPC client ───────────────────────────────────────────────────────
