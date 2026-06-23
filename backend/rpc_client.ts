@@ -10,20 +10,35 @@ import {
   Transaction,
   FeeBumpTransaction,
 } from "@stellar/stellar-sdk";
+import { ZodError } from "zod";
 import { config } from "./config";
 
 // ─── Exponential back-off retry ─────────────────────────────────────────────
 
-async function withRetry<T>(
+/**
+ * Returns false for deterministic failures (ZodError, TypeError) that will
+ * never succeed on retry, true for transient errors worth retrying.
+ */
+export function DEFAULT_IS_RETRYABLE(err: unknown): boolean {
+  if (err instanceof ZodError) return false;
+  if (err instanceof TypeError) return false;
+  return true;
+}
+
+export async function withRetry<T>(
   fn: () => Promise<T>,
   retries = config.MAX_RETRIES,
-  delayMs = config.RETRY_DELAY_MS
+  delayMs = config.RETRY_DELAY_MS,
+  isRetryable: (err: unknown) => boolean = DEFAULT_IS_RETRYABLE
 ): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       return await fn();
     } catch (err) {
+      if (!isRetryable(err)) {
+        throw err;
+      }
       lastErr = err;
       console.warn(`⚠️  Attempt ${attempt}/${retries} failed:`, (err as Error).message);
       if (attempt < retries) {
@@ -41,11 +56,11 @@ export const horizonServer = new Horizon.Server(config.HORIZON_URL, {
 });
 
 export async function loadAccount(publicKey: string) {
-  return withRetry(() => horizonServer.loadAccount(publicKey));
+  return withRetry(() => horizonServer.loadAccount(publicKey), config.MAX_RETRIES, config.RETRY_DELAY_MS, DEFAULT_IS_RETRYABLE);
 }
 
 export async function submitTransaction(tx: Transaction | FeeBumpTransaction) {
-  return withRetry(() => horizonServer.submitTransaction(tx));
+  return withRetry(() => horizonServer.submitTransaction(tx), config.MAX_RETRIES, config.RETRY_DELAY_MS, DEFAULT_IS_RETRYABLE);
 }
 
 // ─── Soroban RPC client ───────────────────────────────────────────────────────
@@ -59,7 +74,7 @@ export const sorobanServer = new SorobanRpc.Server(config.SOROBAN_RPC_URL, {
  * Returns the simulation result — callers MUST check for errors.
  */
 export async function simulateSorobanTx(tx: Transaction) {
-  return withRetry(() => sorobanServer.simulateTransaction(tx));
+  return withRetry(() => sorobanServer.simulateTransaction(tx), config.MAX_RETRIES, config.RETRY_DELAY_MS, DEFAULT_IS_RETRYABLE);
 }
 
 /**
