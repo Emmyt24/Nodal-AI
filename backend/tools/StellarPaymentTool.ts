@@ -8,6 +8,7 @@
 
 import {
   Keypair,
+  Horizon,
   Networks,
   TransactionBuilder,
   Operation,
@@ -23,7 +24,12 @@ import { loadAccount, submitTransaction } from "../rpc_client";
 
 export const PaymentInputSchema = z.object({
   destination: z.string().length(56, "Invalid Stellar public key"),
-  amount: z.string().regex(/^\d+(\.\d{1,7})?$/, "Amount must be a valid Stellar decimal"),
+  amount: z
+    .string()
+    .regex(/^\d+(\.\d{1,7})?$/, "Amount must be a valid Stellar decimal")
+    .refine((val) => parseFloat(val) > 0, {
+      message: "Amount must be a valid Stellar decimal (greater than zero)",
+    }),
   assetCode: z.string().default("XLM"),
   assetIssuer: z.string().optional(),
   memo: z.string().max(28).optional(),
@@ -61,7 +67,9 @@ export class StellarPaymentTool {
    * Execute a payment.
    * Steps: validate → build → simulate (fee bump check) → sign → submit
    */
-  async execute(rawInput: unknown): Promise<{ txHash: string; ledger: number }> {
+  async execute(
+    rawInput: unknown
+  ): Promise<{ txHash: string; ledger: number }> {
     // 1. Validate input
     const input = PaymentInputSchema.parse(rawInput);
 
@@ -86,18 +94,18 @@ export class StellarPaymentTool {
           amount: input.amount,
         })
       )
-      .setTimeout(30);
+    
 
     if (input.memo) {
       txBuilder.addMemo(Memo.text(input.memo));
     }
 
-    const tx = txBuilder.build();
+const tx = txBuilder.setTimeout(30).build();
 
     // 5. Fee estimation / simulation via Horizon dry-run
     //    (Horizon doesn't expose simulation like Soroban, so we validate
     //     the transaction envelope locally before submission)
-    console.log(`🔍 [StellarPaymentTool] Validating payment envelope...`);
+    console.log(` [StellarPaymentTool] Validating payment envelope...`);
     console.log(`   Source  : ${this.keypair.publicKey()}`);
     console.log(`   Dest    : ${input.destination}`);
     console.log(`   Amount  : ${input.amount} ${input.assetCode}`);
@@ -106,8 +114,11 @@ export class StellarPaymentTool {
     tx.sign(this.keypair);
 
     // 7. Submit
-    const result = await submitTransaction(tx) as { hash: string; ledger: number };
-
+    const result = (await submitTransaction(tx)) as {
+      hash: string;
+      ledger: number;
+    };
+    
     return {
       txHash: result.hash,
       ledger: result.ledger,
