@@ -56,6 +56,11 @@ export class PayFiAgent {
   private sorobanTool: SorobanInvokeTool;
   private x402Tool: X402PaymentTool;
 
+  // Graceful-shutdown state
+  private isDraining = false;
+  private activeTasks = 0;
+  private drainResolvers: Array<() => void> = [];
+
   constructor() {
     // Pass the secret via agentKeypair() — tools call this internally
     this.paymentTool = new StellarPaymentTool(config.agentKeypair().secret());
@@ -71,8 +76,30 @@ export class PayFiAgent {
     console.log(`   Spending limit : ${config.AGENT_SPENDING_LIMIT} ${config.X402_ASSET_CODE}`);
   }
 
+  /** Signal the agent to stop accepting new tasks. */
+  drain(): void {
+    this.isDraining = true;
+  }
+
+  /** Resolve when all in-flight tasks have settled. */
+  waitForPendingTasks(): Promise<void> {
+    if (this.activeTasks === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.drainResolvers.push(resolve);
+    });
+  }
+
   /** Dispatch a task to the correct tool */
   async run(task: AgentTask): Promise<AgentResult> {
+    if (this.isDraining) {
+      return {
+        success: false,
+        taskType: task.type,
+        error: "Agent is shutting down — task rejected",
+      };
+    }
+
+    this.activeTasks++;
     console.log(`\n🚀 [Agent] Running task: ${task.type}`);
     try {
       let data: unknown;
@@ -108,6 +135,12 @@ export class PayFiAgent {
       const safe = message.replace(/S[A-Z2-7]{55}/g, "[REDACTED]");
       console.error(`❌ [Agent] Task failed: ${task.type} — ${safe}`);
       return { success: false, taskType: task.type, error: safe };
+    } finally {
+      this.activeTasks--;
+      if (this.activeTasks === 0) {
+        this.drainResolvers.forEach((r) => r());
+        this.drainResolvers = [];
+      }
     }
   }
 }
