@@ -125,6 +125,15 @@ export class PayFiAgent extends EventEmitter {
 
   /** Dispatch a task to the correct tool */
   async run(task: AgentTask): Promise<AgentResult> {
+    if (this.isDraining) {
+      return {
+        success: false,
+        taskType: task.type,
+        error: "Agent is shutting down — task rejected",
+      };
+    }
+
+    this.activeTasks++;
     console.log(`\n🚀 [Agent] Running task: ${task.type}`);
     try {
       let data: unknown;
